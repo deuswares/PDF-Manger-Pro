@@ -1,19 +1,3 @@
-Below is a **complete, professional, and fully-structured README.md** for your GitHub repository.
-It includes:
-
-* Project introduction
-* Features
-* Full installation guide
-* Required dependencies
-* Tesseract & Poppler setup
-* How to run the program
-* PyInstaller build instructions
-* Troubleshooting
-* Folder structure
-* Contribution, License, Credits
-
-You can copy-paste this directly into your repository as **README.md**.
-
 ---
 
 # **PDF Manager – Metadata Editor & OCR Preview (PyQt5 GUI)**
