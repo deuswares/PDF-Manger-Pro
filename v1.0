@@ -1,0 +1,1354 @@
+import os
+import sys
+import shutil
+import tempfile
+import io
+import uuid
+import re
+
+from PyQt5.QtCore import Qt, QDir, QSettings, QUrl, QRect
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
+    QPushButton, QLineEdit, QFileDialog, QFileSystemModel, QTreeView,
+    QFormLayout, QGroupBox, QCheckBox, QTextEdit, QMessageBox,
+    QFontDialog, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
+    QMenu
+)
+from PyQt5.QtGui import QFont, QPainter, QPen, QColor, QDesktopServices
+
+from PyPDF2 import PdfReader, PdfWriter
+
+import fitz  # PyMuPDF
+import pytesseract
+from PIL import Image
+
+# مسیر Tesseract
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
+
+def sanitize_filename(name: str) -> str:
+    """
+    پاک‌سازی نام فایل از کاراکترهای نامعتبر ویندوز و جلوگیری از خالی بودن.
+    """
+    invalid_chars = '<>:"/\\|?*'
+    result = ''.join('_' if c in invalid_chars else c for c in name)
+    result = result.strip()
+    if not result:
+        result = "untitled"
+    return result
+
+
+class FileTreeView(QTreeView):
+    """
+    TreeView سفارشی:
+    - Delete → حذف فایل از دیسک
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    # --- حذف فایل با کلید Delete ---
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete:
+            index = self.currentIndex()
+            if index and index.isValid():
+                model = self.model()
+                if not model:
+                    return
+                path = model.filePath(index)
+                if os.path.isfile(path):
+                    try:
+                        os.remove(path)
+                        root_path = model.rootPath()
+                        model.setRootPath(root_path)
+                        # تلاش برای لاگ کردن در parent (اگر PDFManager باشد)
+                        parent = self.parent()
+                        if parent and hasattr(parent, "log"):
+                            parent.log(f"Deleted file: {path}")
+                    except Exception as e:
+                        parent = self.parent()
+                        if parent and hasattr(parent, "log"):
+                            parent.log(f"[ERROR] Cannot delete file: {e}")
+            return
+
+        super().keyPressEvent(event)
+
+
+class FileStatusDelegate(QStyledItemDelegate):
+    """
+    Delegate اختصاصی برای ستون اول:
+    - برای پوشه‌ها و آیتم‌های غیر PDF → رفتار پیش‌فرض Qt
+    - برای PDF:
+        * اگر فایل نشانه‌گذاری شده باشد: پس‌زمینه زرد ملایم
+        * علامت وضعیت (تیک / دایره / ضربدر) به جای آیکن PDF، در سمت چپ
+        * متن نام فایل در سمت راست
+    """
+
+    def __init__(self, parent, pdf_manager):
+        super().__init__(parent)
+        self.pdf_manager = pdf_manager
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        # فقط ستون نام فایل
+        if index.column() != 0:
+            return super().paint(painter, option, index)
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+
+        path = self.pdf_manager.model.filePath(index) if hasattr(self.pdf_manager, "model") else ""
+
+        # اگر PDF نیست، رندر پیش‌فرض را انجام بده
+        if not path or not path.lower().endswith(".pdf") or not os.path.isfile(path):
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        rect = opt.rect
+
+        # اول پس‌زمینه انتخاب‌شده یا نشانه‌گذاری
+        if opt.state & QStyle.State_Selected:
+            painter.fillRect(rect, opt.palette.highlight())
+        elif self.pdf_manager.is_marked_file(path):
+            painter.fillRect(rect, QColor(255, 255, 200))  # زرد ملایم
+
+        # وضعیت فایل: tick / circle / cross
+        status = self.pdf_manager.get_file_status_for_index(index)
+
+        icon_size = min(rect.height() - 6, 20)
+        if icon_size < 10:
+            icon_size = 10
+
+        # مستطیل علامت وضعیت (به‌جای آیکن PDF)
+        status_rect = QRect(
+            rect.left() + 6,
+            rect.top() + (rect.height() - icon_size) // 2,
+            icon_size,
+            icon_size
+        )
+
+        # مستطیل متن
+        text_rect = QRect(
+            status_rect.right() + 8,
+            rect.top(),
+            rect.width() - (status_rect.width() + 20),
+            rect.height()
+        )
+
+        # ------------------------ رسم علامت وضعیت ------------------------
+        if status:
+            pen = QPen()
+            if status == "tick":
+                pen.setColor(QColor(0, 150, 0))
+            elif status == "circle":
+                pen.setColor(QColor(200, 140, 0))
+            else:
+                pen.setColor(QColor(180, 0, 0))
+
+            pen.setWidth(2)
+            painter.setPen(pen)
+
+            if status == "tick":
+                # تیک
+                painter.drawLine(
+                    status_rect.left() + 3,
+                    status_rect.center().y(),
+                    status_rect.left() + status_rect.width() // 2 - 1,
+                    status_rect.bottom() - 3
+                )
+                painter.drawLine(
+                    status_rect.left() + status_rect.width() // 2 - 1,
+                    status_rect.bottom() - 3,
+                    status_rect.right() - 3,
+                    status_rect.top() + 3
+                )
+            elif status == "circle":
+                painter.drawEllipse(status_rect.adjusted(1, 1, -1, -1))
+            else:
+                painter.drawLine(status_rect.topLeft(), status_rect.bottomRight())
+                painter.drawLine(status_rect.bottomLeft(), status_rect.topRight())
+
+        # ------------------------ رسم متن نام فایل ------------------------
+        if opt.state & QStyle.State_Selected:
+            painter.setPen(opt.palette.highlightedText().color())
+        else:
+            painter.setPen(opt.palette.text().color())
+
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, opt.text)
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        size.setHeight(max(size.height(), 24))
+        return size
+
+
+class PDFManager(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("PDF Manager - Metadata & Preview (+ OCR)")
+        self.resize(1200, 700)
+
+        self.current_pdf_path = None
+        self.temp_dir = tempfile.mkdtemp(prefix="pdf_manager_")
+
+        self.ocr_lang_primary = "fas"
+        self.ocr_lang_fallback = "fa"
+
+        self.disable_ocr = False
+        self.metadata_history = []
+        self.preview_is_rtl = True
+
+        self.settings = QSettings("Myfoxit", "PDF_Manager")
+
+        # کش وضعیت فایل‌ها برای آیکن وضعیت
+        # ساختار: { path: (mtime, status_str) }
+        self._status_cache = {}
+
+        # مجموعه‌ی فایل‌های نشانه‌گذاری‌شده
+        self._marked_files = set()
+
+        self._build_ui()
+        self.load_settings()
+
+    # ------------------------- UI BUILD ----------------------------
+
+    def _build_ui(self):
+        main_layout = QHBoxLayout(self)
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
+
+        # LEFT PANEL
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+
+        folder_layout = QHBoxLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setReadOnly(True)
+        browse_btn = QPushButton("Select Folder")
+        browse_btn.clicked.connect(self.select_folder)
+        folder_layout.addWidget(self.folder_edit)
+        folder_layout.addWidget(browse_btn)
+        left_layout.addLayout(folder_layout)
+
+        self.model = QFileSystemModel()
+        self.model.setFilter(QDir.NoDotAndDotDot | QDir.Files | QDir.AllDirs)
+        self.model.setNameFilters(["*.pdf", "*.PDF"])
+        self.model.setNameFilterDisables(False)
+
+        self.tree = FileTreeView(self)
+        self.tree.setModel(self.model)
+
+        # ستون‌ها: 0=Name, 1=Size, 2=Type, 3=Date Modified
+        self.tree.hideColumn(1)
+        self.tree.hideColumn(2)
+
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(3, Qt.DescendingOrder)
+
+        # فقط انتخاب (selection) باعث لود شدن PDF می‌شود
+        self.tree.selectionModel().selectionChanged.connect(self.on_selection_changed)
+
+        # Delegate وضعیت برای ستون اول
+        self.status_delegate = FileStatusDelegate(self.tree, self)
+        self.tree.setItemDelegateForColumn(0, self.status_delegate)
+
+        # منوی راست‌کلیک سفارشی
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.on_tree_context_menu)
+
+        left_layout.addWidget(self.tree)
+        splitter.addWidget(left_widget)
+
+        # RIGHT PANEL
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        # --------------------- METADATA GROUP ---------------------
+        meta_group = QGroupBox("PDF Metadata")
+        meta_layout = QFormLayout(meta_group)
+
+        # File name + font button
+        fname_layout = QHBoxLayout()
+        self.file_name_edit = QLineEdit()
+        self.file_name_edit.setFont(QFont("BTitr", 12))
+
+        self.filename_font_btn = QPushButton("Change File Name Font")
+        self.filename_font_btn.clicked.connect(self.change_filename_font)
+
+        fname_layout.addWidget(self.file_name_edit)
+        fname_layout.addWidget(self.filename_font_btn)
+
+        meta_layout.addRow("File Name:", fname_layout)
+
+        # سایر فیلدها
+        self.title_edit = QLineEdit()
+        self.author_edit = QLineEdit()
+        self.subject_edit = QLineEdit()
+        self.keywords_edit = QLineEdit()
+        self.producer_edit = QLineEdit()
+        self.creator_edit = QLineEdit()
+        self.creation_date_edit = QLineEdit()
+        self.mod_date_edit = QLineEdit()
+
+        meta_layout.addRow("Title:", self.title_edit)
+        meta_layout.addRow("Author:", self.author_edit)
+        meta_layout.addRow("Subject:", self.subject_edit)
+        meta_layout.addRow("Keywords:", self.keywords_edit)
+        meta_layout.addRow("Producer:", self.producer_edit)
+        meta_layout.addRow("Creator:", self.creator_edit)
+        meta_layout.addRow("Creation date:", self.creation_date_edit)
+        meta_layout.addRow("Modification date:", self.mod_date_edit)
+
+        right_layout.addWidget(meta_group)
+
+        # --------------------- BUTTONS (ACTIONS) ---------------------
+        actions_layout = QHBoxLayout()
+
+        left_btns = QHBoxLayout()
+        self.rename_checkbox = QCheckBox("Rename file to Title")
+
+        undo_btn = QPushButton("Undo Metadata / Rename")
+        undo_btn.clicked.connect(self.undo_metadata_changes)
+
+        # دکمه Batch برای Author
+        self.batch_author_btn = QPushButton("Set All Authors from File Names")
+        self.batch_author_btn.clicked.connect(self.batch_set_authors_from_filenames)
+
+        # دکمه Batch برای Title
+        self.batch_title_btn = QPushButton("Set All Titles from File Names")
+        self.batch_title_btn.clicked.connect(self.batch_set_titles_from_filenames)
+
+        left_btns.addWidget(self.rename_checkbox)
+        left_btns.addWidget(undo_btn)
+        left_btns.addWidget(self.batch_author_btn)
+        left_btns.addWidget(self.batch_title_btn)
+
+        right_btns = QHBoxLayout()
+        self.ocr_toggle_btn = QPushButton("Preview: No OCR Mode OFF")
+        self.ocr_toggle_btn.clicked.connect(self.toggle_ocr_mode)
+
+        ocr_btn = QPushButton("Run OCR (first page)")
+        ocr_btn.clicked.connect(self.on_ocr_button_clicked)
+
+        right_btns.addWidget(self.ocr_toggle_btn)
+        right_btns.addWidget(ocr_btn)
+
+        actions_layout.addLayout(left_btns)
+        actions_layout.addStretch()
+        actions_layout.addLayout(right_btns)
+
+        right_layout.addLayout(actions_layout)
+
+        # --------------------- PREVIEW GROUP ---------------------
+        preview_group = QGroupBox("Preview (first page / OCR)")
+        preview_layout = QVBoxLayout(preview_group)
+
+        preview_toolbar = QHBoxLayout()
+        self.preview_font_btn = QPushButton("Change Preview Font")
+        self.preview_font_btn.clicked.connect(self.change_preview_font)
+
+        self.preview_align_left_btn = QPushButton("Align Left")
+        self.preview_align_left_btn.clicked.connect(self.set_preview_alignment_left)
+
+        self.preview_align_right_btn = QPushButton("Align Right")
+        self.preview_align_right_btn.clicked.connect(self.set_preview_alignment_right)
+
+        preview_toolbar.addWidget(self.preview_font_btn)
+        preview_toolbar.addWidget(self.preview_align_left_btn)
+        preview_toolbar.addWidget(self.preview_align_right_btn)
+        preview_toolbar.addStretch()
+
+        preview_layout.addLayout(preview_toolbar)
+
+        self.preview_edit = QTextEdit()
+        self.preview_edit.setReadOnly(True)
+        self.preview_edit.setFont(QFont("Tahoma", 11))
+        self.preview_edit.setLayoutDirection(Qt.RightToLeft)
+        self.preview_edit.setAlignment(Qt.AlignRight)
+
+        opt = self.preview_edit.document().defaultTextOption()
+        opt.setTextDirection(Qt.RightToLeft)
+        opt.setAlignment(Qt.AlignRight)
+        self.preview_edit.document().setDefaultTextOption(opt)
+
+        preview_layout.addWidget(self.preview_edit)
+        right_layout.addWidget(preview_group, stretch=2)
+
+        # --------------------- LOG ---------------------
+        log_group = QGroupBox("Log")
+        log_layout = QVBoxLayout(log_group)
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_edit)
+        right_layout.addWidget(log_group, stretch=1)
+
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+
+        # --------------------- SIGNALS ---------------------
+        self.file_name_edit.editingFinished.connect(self.on_file_name_edited)
+        self.file_name_edit.textChanged.connect(self.on_file_name_text_changed)
+
+        for widget in [
+            self.title_edit, self.author_edit, self.subject_edit,
+            self.keywords_edit, self.producer_edit, self.creator_edit,
+            self.creation_date_edit, self.mod_date_edit
+        ]:
+            widget.editingFinished.connect(self.on_metadata_field_edited)
+
+    # ------------------------- CONTEXT MENU (RIGHT CLICK) ---------
+
+    def on_tree_context_menu(self, pos):
+        index = self.tree.indexAt(pos)
+        if not index.isValid():
+            return
+
+        path = self.model.filePath(index)
+        if not (path and os.path.isfile(path) and path.lower().endswith(".pdf")):
+            return
+
+        menu = QMenu(self)
+
+        open_action = menu.addAction("Open File (Default Application)")
+
+        is_marked = self.is_marked_file(path)
+        mark_action = menu.addAction("Unmark File" if is_marked else "Mark File")
+
+        action = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+        if action is None:
+            return
+
+        if action == open_action:
+            self.open_file_external(path)
+        elif action == mark_action:
+            self.toggle_mark_for_path(path)
+
+    # ------------------------- SETTINGS ----------------------------
+
+    def load_settings(self):
+        geom = self.settings.value("geometry")
+        if geom is not None:
+            self.restoreGeometry(geom)
+
+        last_folder = self.settings.value("lastFolder", "", type=str)
+        if last_folder and os.path.isdir(last_folder):
+            self.folder_edit.setText(last_folder)
+            self.model.setRootPath(last_folder)
+            idx = self.model.index(last_folder)
+            self.tree.setRootIndex(idx)
+            self.tree.sortByColumn(3, Qt.DescendingOrder)
+
+        self.disable_ocr = self.settings.value("disableOcr", False, type=bool)
+        self.ocr_toggle_btn.setText(
+            "Preview: No OCR Mode ON" if self.disable_ocr else "Preview: No OCR Mode OFF"
+        )
+
+        self.preview_is_rtl = self.settings.value("previewIsRtl", True, type=bool)
+        if self.preview_is_rtl:
+            self.set_preview_alignment_right()
+        else:
+            self.set_preview_alignment_left()
+
+        self.rename_checkbox.setChecked(
+            self.settings.value("renameCheckbox", False, type=bool)
+        )
+
+        fname_font_str = self.settings.value("fileNameFont", "", type=str)
+        if fname_font_str:
+            f = QFont()
+            if f.fromString(fname_font_str):
+                self.file_name_edit.setFont(f)
+
+        preview_font_str = self.settings.value("previewFont", "", type=str)
+        if preview_font_str:
+            f2 = QFont()
+            if f2.fromString(preview_font_str):
+                self.preview_edit.setFont(f2)
+
+        # برگرداندن فایل‌های نشانه‌گذاری‌شده از تنظیمات
+        marked_list = self.settings.value("markedFiles", [], type=list)
+        if isinstance(marked_list, list):
+            for p in marked_list:
+                if isinstance(p, str) and os.path.isfile(p):
+                    self._marked_files.add(os.path.abspath(p))
+
+    def save_settings(self):
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("lastFolder", self.folder_edit.text())
+        self.settings.setValue("disableOcr", self.disable_ocr)
+        self.settings.setValue("previewIsRtl", self.preview_is_rtl)
+        self.settings.setValue("renameCheckbox", self.rename_checkbox.isChecked())
+        self.settings.setValue("fileNameFont", self.file_name_edit.font().toString())
+        self.settings.setValue("previewFont", self.preview_edit.font().toString())
+        # ذخیره لیست فایل‌های نشانه‌گذاری‌شده
+        self.settings.setValue("markedFiles", list(self._marked_files))
+
+    # ------------------------- HELPERS ----------------------------
+
+    def log(self, message: str):
+        self.log_edit.append(message)
+
+    def format_preview_text(self, text: str):
+        if not text:
+            return text
+        if not self.preview_is_rtl:
+            return text
+        lines = text.splitlines()
+        out = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped:
+                out.append("\u202B" + stripped + "\u202C")
+            else:
+                out.append("")
+        return "\n".join(out)
+
+    def change_filename_font(self):
+        font, ok = QFontDialog.getFont(self.file_name_edit.font(), self, "Select file name font")
+        if ok:
+            self.file_name_edit.setFont(font)
+            self.log(f"File name font changed to: {font.family()}")
+
+    def change_preview_font(self):
+        font, ok = QFontDialog.getFont(self.preview_edit.font(), self, "Select preview font")
+        if ok:
+            self.preview_edit.setFont(font)
+            self.log(f"Preview font changed to: {font.family()}")
+
+    def set_preview_alignment_right(self):
+        self.preview_is_rtl = True
+        self.preview_edit.setLayoutDirection(Qt.RightToLeft)
+        self.preview_edit.setAlignment(Qt.AlignRight)
+        opt = self.preview_edit.document().defaultTextOption()
+        opt.setTextDirection(Qt.RightToLeft)
+        opt.setAlignment(Qt.AlignRight)
+        self.preview_edit.document().setDefaultTextOption(opt)
+        self.log("Preview alignment set to Right-to-Left / Right aligned.")
+
+    def set_preview_alignment_left(self):
+        self.preview_is_rtl = False
+        self.preview_edit.setLayoutDirection(Qt.LeftToRight)
+        self.preview_edit.setAlignment(Qt.AlignLeft)
+        opt = self.preview_edit.document().defaultTextOption()
+        opt.setTextDirection(Qt.LeftToRight)
+        opt.setAlignment(Qt.AlignLeft)
+        self.preview_edit.document().setDefaultTextOption(opt)
+        self.log("Preview alignment set to Left-to-Right / Left aligned.")
+
+    # ------------------------- STATUS ICON HELPERS ----------------
+
+    def invalidate_status_for_path(self, path: str):
+        if path in self._status_cache:
+            self._status_cache.pop(path, None)
+
+    def refresh_tree_item_for_path(self, path: str):
+        if not path:
+            return
+        idx = self.model.index(path)
+        if idx.isValid():
+            self.model.dataChanged.emit(idx, idx, [Qt.DisplayRole])
+
+    def get_file_status_for_index(self, index):
+        """
+        برای Delegate:
+        - بر اساس مسیر فایل، وضعیت را برمی‌گرداند: "tick" / "circle" / "cross" یا None
+        """
+        if not index.isValid():
+            return None
+
+        path = self.model.filePath(index)
+        if not path or not path.lower().endswith(".pdf") or not os.path.isfile(path):
+            return None
+
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None
+
+        cached = self._status_cache.get(path)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
+        status = self._compute_file_status(path)
+        self._status_cache[path] = (mtime, status)
+        return status
+
+    def _compute_file_status(self, path: str) -> str:
+        """
+        منطق وضعیت:
+        1) اگر نام فایل == Title و Author = عدد دو تکه با '-'
+           → "tick"
+        2) اگر نام فایل != Title
+           → "circle"
+        3) در غیر این صورت
+           → "cross"
+        """
+        base_name = os.path.splitext(os.path.basename(path))[0].strip()
+        title = ""
+        author = ""
+
+        try:
+            reader = PdfReader(path)
+            info = reader.metadata or {}
+            title = str(info.get("/Title", "") or "").strip()
+            author = str(info.get("/Author", "") or "").strip()
+        except Exception:
+            if base_name:
+                return "circle"
+            return "cross"
+
+        if base_name and title and base_name == title:
+            if re.fullmatch(r"\d+\-\d+", author):
+                return "tick"
+            return "cross"
+
+        if base_name != title:
+            return "circle"
+
+        return "cross"
+
+    # ------------------------- MARKING HELPERS --------------------
+
+    def is_marked_file(self, path: str) -> bool:
+        return os.path.abspath(path) in self._marked_files
+
+    def toggle_mark_for_path(self, path: str):
+        ap = os.path.abspath(path)
+        if ap in self._marked_files:
+            self._marked_files.remove(ap)
+            self.log(f"File unmarked: {path}")
+        else:
+            self._marked_files.add(ap)
+            self.log(f"File marked: {path}")
+
+        self.tree.viewport().update()
+
+    def open_file_external(self, path: str):
+        """
+        باز کردن فایل با برنامه پیش‌فرض سیستم (مثلاً مرورگر یا PDF Viewer).
+        """
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Error", f"File does not exist:\n{path}")
+            return
+        url = QUrl.fromLocalFile(path)
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(self, "Error", "Cannot open file with default application.")
+            self.log(f"[ERROR] Cannot open file externally: {path}")
+        else:
+            self.log(f"File opened with default application: {path}")
+
+    # ------------------------- FOLDER & TREE -----------------------
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select folder containing PDFs", QDir.homePath()
+        )
+        if folder:
+            self.folder_edit.setText(folder)
+            self.model.setRootPath(folder)
+            idx = self.model.index(folder)
+            self.tree.setRootIndex(idx)
+            self.tree.sortByColumn(3, Qt.DescendingOrder)
+            self._status_cache.clear()
+            self.log(f"Folder selected: {folder}")
+            self.tree.viewport().update()
+
+    def on_selection_changed(self, selected, deselected):
+        indexes = selected.indexes()
+        if not indexes:
+            return
+        idx = indexes[0]
+        path = self.model.filePath(idx)
+        if os.path.isfile(path) and path.lower().endswith(".pdf"):
+            self.load_pdf(path)
+
+    # ------------------------- CLEAR ------------------------------
+
+    def clear_fields(self):
+        self.current_pdf_path = None
+        self.file_name_edit.clear()
+        self.title_edit.clear()
+        self.author_edit.clear()
+        self.subject_edit.clear()
+        self.keywords_edit.clear()
+        self.producer_edit.clear()
+        self.creator_edit.clear()
+        self.creation_date_edit.clear()
+        self.mod_date_edit.clear()
+        self.preview_edit.clear()
+        self.metadata_history.clear()
+
+    # ------------------------- OCR -------------------------------
+
+    def run_ocr_on_first_page(self, force_display=False):
+        if not self.current_pdf_path:
+            msg = "[OCR] No PDF selected."
+            self.log(msg)
+            if force_display:
+                self.preview_edit.setPlainText(self.format_preview_text(msg))
+            return ""
+
+        self.log(f"Running OCR on first page: {self.current_pdf_path}")
+
+        try:
+            doc = fitz.open(self.current_pdf_path)
+            if doc.page_count == 0:
+                raise RuntimeError("PDF has no pages.")
+            page = doc.load_page(0)
+            pix = page.get_pixmap()
+            img_bytes = pix.tobytes("png")
+            image = Image.open(io.BytesIO(img_bytes))
+        except Exception as e:
+            msg = f"[ERROR] Cannot render PDF page for OCR: {e}"
+            self.log(msg)
+            if force_display:
+                self.preview_edit.setPlainText(self.format_preview_text(msg))
+            return ""
+
+        try:
+            text = pytesseract.image_to_string(image, lang=self.ocr_lang_primary)
+        except Exception as e_primary:
+            self.log(f"[WARN] OCR primary failed: {e_primary}")
+            try:
+                text = pytesseract.image_to_string(image, lang=self.ocr_lang_fallback)
+            except Exception as e_fallback:
+                msg = f"[ERROR] OCR failed completely: {e_fallback}"
+                self.log(msg)
+                if force_display:
+                    self.preview_edit.setPlainText(self.format_preview_text(msg))
+                return ""
+
+        text = (text or "").strip()
+
+        if force_display:
+            self.preview_edit.setPlainText(self.format_preview_text(text))
+
+        return text
+
+    def on_ocr_button_clicked(self):
+        if not self.current_pdf_path:
+            self.log("[OCR button] No PDF selected.")
+            return
+        self.run_ocr_on_first_page(force_display=True)
+
+    def toggle_ocr_mode(self):
+        self.disable_ocr = not self.disable_ocr
+        if self.disable_ocr:
+            self.ocr_toggle_btn.setText("Preview: No OCR Mode ON")
+            self.log("OCR disabled for preview.")
+        else:
+            self.ocr_toggle_btn.setText("Preview: No OCR Mode OFF")
+            self.log("OCR enabled for preview.")
+
+        if self.current_pdf_path:
+            self.load_pdf(self.current_pdf_path)
+
+    # ------------------------- FILE NAME --------------------------
+
+    def on_file_name_text_changed(self, text: str):
+        """
+        وقتی تیک 'Rename file to Title' فعال باشد،
+        تغییر در File Name، Title را نیز زنده آپدیت می‌کند.
+        """
+        if self.rename_checkbox.isChecked():
+            base = os.path.splitext(text)[0]
+            self.title_edit.setText(base)
+
+    def on_file_name_edited(self):
+        """
+        در خروج از فیلد نام فایل:
+        - نام جدید (بدون پسوند) گرفته می‌شود
+        - فایل روی دیسک با پسوند .pdf تغییر نام می‌دهد
+        - در فیلد فقط نام بدون پسوند نمایش داده می‌شود
+        """
+        if not self.current_pdf_path:
+            return
+
+        raw_text = self.file_name_edit.text().strip()
+        if not raw_text:
+            QMessageBox.warning(self, "Warning", "File name cannot be empty.")
+            current_base = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
+            self.file_name_edit.setText(current_base)
+            return
+
+        base, ext = os.path.splitext(raw_text)
+        if not base:
+            base = raw_text
+
+        new_base = sanitize_filename(base)
+        new_name = new_base + ".pdf"
+
+        old_path = self.current_pdf_path
+
+        # اسنپ‌شات قبل از Rename
+        try:
+            reader = PdfReader(self.current_pdf_path)
+            info = reader.metadata or {}
+
+            def gm(k):
+                try:
+                    return str(info.get(k, "") or "")
+                except Exception:
+                    return ""
+
+            self.metadata_history.append({
+                "FilePath": self.current_pdf_path,
+                "FileName": os.path.basename(self.current_pdf_path),
+                "Title": gm("/Title"),
+                "Author": gm("/Author"),
+                "Subject": gm("/Subject"),
+                "Keywords": gm("/Keywords"),
+                "Producer": gm("/Producer"),
+                "Creator": gm("/Creator"),
+                "CreationDate": gm("/CreationDate"),
+                "ModDate": gm("/ModDate"),
+            })
+        except Exception as e:
+            self.log(f"[WARN] Could not snapshot metadata before rename: {e}")
+
+        folder = os.path.dirname(self.current_pdf_path)
+        new_path = os.path.join(folder, new_name)
+
+        if os.path.abspath(new_path) == os.path.abspath(self.current_pdf_path):
+            self.file_name_edit.setText(new_base)
+            return
+
+        if os.path.exists(new_path):
+            QMessageBox.warning(self, "Warning", f"File already exists:\n{new_path}")
+            old_base = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
+            self.file_name_edit.setText(old_base)
+            return
+
+        try:
+            os.rename(self.current_pdf_path, new_path)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Rename failed:\n{e}")
+            self.log(f"[ERROR] Rename failed: {e}")
+            old_base = os.path.splitext(os.path.basename(self.current_pdf_path))[0]
+            self.file_name_edit.setText(old_base)
+            return
+
+        # بروزرسانی مسیر فعلی، کش وضعیت و TreeView
+        self.invalidate_status_for_path(old_path)
+        self.invalidate_status_for_path(new_path)
+
+        # اگر فایل نشانه‌گذاری شده بود، مسیر جدید را جایگزین کنیم
+        ap_old = os.path.abspath(old_path)
+        ap_new = os.path.abspath(new_path)
+        if ap_old in self._marked_files:
+            self._marked_files.remove(ap_old)
+            self._marked_files.add(ap_new)
+
+        self.current_pdf_path = new_path
+        self.file_name_edit.setText(new_base)
+        self.log(f"File renamed to: {new_name}")
+
+        if self.folder_edit.text():
+            idx = self.model.index(self.folder_edit.text())
+            self.tree.setRootIndex(idx)
+            self.tree.sortByColumn(3, Qt.DescendingOrder)
+
+        self.refresh_tree_item_for_path(new_path)
+        self.tree.viewport().update()
+
+    # ------------------------- METADATA AUTO ----------------------
+
+    def on_metadata_field_edited(self):
+        """
+        هر فیلد متادیتا وقتی فوکِس را از دست بدهد، متادیتا ذخیره می‌شود.
+        """
+        if not self.current_pdf_path:
+            return
+        self.save_metadata(auto=True, add_to_history=True)
+        self.invalidate_status_for_path(self.current_pdf_path)
+        self.refresh_tree_item_for_path(self.current_pdf_path)
+        self.tree.viewport().update()
+
+    # ------------------------- LOAD PDF --------------------------
+
+    def load_pdf(self, path):
+        self.clear_fields()
+        self.current_pdf_path = path
+
+        base_name = os.path.splitext(os.path.basename(path))[0]
+        self.file_name_edit.setText(base_name)
+
+        self.log(f"Loading PDF: {path}")
+
+        try:
+            reader = PdfReader(path)
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Cannot open PDF:\n{e}")
+            self.log(f"[ERROR] Cannot open PDF: {e}")
+            return
+
+        info = reader.metadata or {}
+
+        def gm(k):
+            try:
+                return str(info.get(k, "") or "")
+            except Exception:
+                return ""
+
+        self.title_edit.setText(gm("/Title"))
+        self.author_edit.setText(gm("/Author"))
+        self.subject_edit.setText(gm("/Subject"))
+        self.keywords_edit.setText(gm("/Keywords"))
+        self.producer_edit.setText(gm("/Producer"))
+        self.creator_edit.setText(gm("/Creator"))
+        self.creation_date_edit.setText(gm("/CreationDate"))
+        self.mod_date_edit.setText(gm("/ModDate"))
+
+        preview = ""
+        try:
+            if reader.pages:
+                preview = reader.pages[0].extract_text() or ""
+        except Exception as e:
+            preview = f"[Error extracting text: {e}]"
+
+        if not preview.strip():
+            if not self.disable_ocr:
+                self.log("No extractable text → Trying OCR...")
+                preview = self.run_ocr_on_first_page(False)
+                if not preview:
+                    preview = "[No extractable text + OCR empty]"
+            else:
+                preview = "[No extractable text (OCR disabled)]"
+
+        self.preview_edit.setPlainText(self.format_preview_text(preview))
+        self.log("Metadata + preview loaded.")
+
+        self.refresh_tree_item_for_path(path)
+        self.tree.viewport().update()
+
+    # ------------------------- BATCH: AUTHOR FROM FILENAME -------
+
+    def batch_set_authors_from_filenames(self):
+        """
+        برای تمام فایل‌های PDF داخل فولدر انتخاب‌شده:
+        Author = FileName (بدون پسوند)
+        بدون تغییر نام فایل و بدون دست‌کاری سایر فیلدها.
+        """
+        folder = self.folder_edit.text().strip()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "Warning", "Please select a valid folder first.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Batch Operation",
+            (
+                "This will set the PDF Author of ALL PDFs in the selected folder\n"
+                "to their file name (without extension).\n\n"
+                "Only the Author field will be changed.\n"
+                "Do you want to continue?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.log("=== Batch: Set All Authors from File Names (start) ===")
+
+        processed = 0
+        failed = 0
+
+        for root, dirs, files in os.walk(folder):
+            for fname in files:
+                if not fname.lower().endswith(".pdf"):
+                    continue
+                full_path = os.path.join(root, fname)
+                base_name = os.path.splitext(fname)[0]
+                new_author = sanitize_filename(base_name)
+                ok = self._set_pdf_author_only(full_path, new_author)
+                if ok:
+                    processed += 1
+                    self.log(f"[BATCH] Author set for: {full_path}")
+                else:
+                    failed += 1
+                    self.log(f"[BATCH-ERROR] Failed for: {full_path}")
+
+        self.log(
+            f"=== Batch finished. Success: {processed}, Failed: {failed} ==="
+        )
+
+        self._status_cache.clear()
+        self.tree.viewport().update()
+
+        if self.current_pdf_path and os.path.isfile(self.current_pdf_path):
+            self.load_pdf(self.current_pdf_path)
+
+    def _set_pdf_author_only(self, path: str, new_author: str) -> bool:
+        try:
+            reader = PdfReader(path)
+        except Exception:
+            return False
+
+        info = reader.metadata or {}
+        new_meta = {}
+
+        for k, v in info.items():
+            try:
+                new_meta[k] = str(v)
+            except Exception:
+                pass
+
+        if new_author:
+            new_meta["/Author"] = new_author
+        else:
+            new_meta.pop("/Author", None)
+
+        writer = PdfWriter()
+        for p in reader.pages:
+            writer.add_page(p)
+
+        writer.add_metadata(new_meta)
+
+        tmp_name = f"batch_author_{uuid.uuid4().hex}.pdf"
+        temp_out = os.path.join(self.temp_dir, tmp_name)
+
+        try:
+            with open(temp_out, "wb") as f:
+                writer.write(f)
+        except Exception:
+            return False
+
+        try:
+            shutil.move(temp_out, path)
+        except Exception:
+            return False
+
+        return True
+
+    # ------------------------- BATCH: ALL TITLES -----------------
+
+    def batch_set_titles_from_filenames(self):
+        """
+        برای تمام فایل‌های PDF داخل فولدر انتخاب‌شده:
+        Title = FileName (بدون پسوند)
+        بدون تغییر نام فایل و بدون دست‌کاری سایر فیلدها.
+        """
+        folder = self.folder_edit.text().strip()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, "Warning", "Please select a valid folder first.")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Batch Operation",
+            (
+                "This will set the PDF Title of ALL PDFs in the selected folder\n"
+                "to their file name (without extension).\n\n"
+                "Only the Title field will be changed.\n"
+                "Do you want to continue?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.log("=== Batch: Set All Titles from File Names (start) ===")
+
+        processed = 0
+        failed = 0
+
+        for root, dirs, files in os.walk(folder):
+            for fname in files:
+                if not fname.lower().endswith(".pdf"):
+                    continue
+                full_path = os.path.join(root, fname)
+                base_name = os.path.splitext(fname)[0]
+                new_title = sanitize_filename(base_name)
+                ok = self._set_pdf_title_only(full_path, new_title)
+                if ok:
+                    processed += 1
+                    self.log(f"[BATCH] Title set for: {full_path}")
+                else:
+                    failed += 1
+                    self.log(f"[BATCH-ERROR] Failed for: {full_path}")
+
+        self.log(
+            f"=== Batch finished. Success: {processed}, Failed: {failed} ==="
+        )
+
+        self._status_cache.clear()
+        self.tree.viewport().update()
+
+        if self.current_pdf_path and os.path.isfile(self.current_pdf_path):
+            self.load_pdf(self.current_pdf_path)
+
+    def _set_pdf_title_only(self, path: str, new_title: str) -> bool:
+        try:
+            reader = PdfReader(path)
+        except Exception:
+            return False
+
+        info = reader.metadata or {}
+        new_meta = {}
+
+        for k, v in info.items():
+            try:
+                new_meta[k] = str(v)
+            except Exception:
+                pass
+
+        if new_title:
+            new_meta["/Title"] = new_title
+        else:
+            new_meta.pop("/Title", None)
+
+        writer = PdfWriter()
+        for p in reader.pages:
+            writer.add_page(p)
+
+        writer.add_metadata(new_meta)
+
+        tmp_name = f"batch_{uuid.uuid4().hex}.pdf"
+        temp_out = os.path.join(self.temp_dir, tmp_name)
+
+        try:
+            with open(temp_out, "wb") as f:
+                writer.write(f)
+        except Exception:
+            return False
+
+        try:
+            shutil.move(temp_out, path)
+        except Exception:
+            return False
+
+        return True
+
+    # ------------------------- SAVE METADATA ---------------------
+
+    def save_metadata(self, auto=False, add_to_history=True):
+        if not self.current_pdf_path:
+            return
+
+        prev_path = self.current_pdf_path
+        prev_name = os.path.basename(prev_path) if prev_path else ""
+
+        try:
+            reader = PdfReader(self.current_pdf_path)
+        except Exception as e:
+            self.log(f"[ERROR] Cannot read PDF for writing: {e}")
+            return
+
+        info = reader.metadata or {}
+
+        def pm(k):
+            try:
+                return str(info.get(k, "") or "")
+            except Exception:
+                return ""
+
+        if add_to_history:
+            self.metadata_history.append({
+                "FilePath": prev_path,
+                "FileName": prev_name,
+                "Title": pm("/Title"),
+                "Author": pm("/Author"),
+                "Subject": pm("/Subject"),
+                "Keywords": pm("/Keywords"),
+                "Producer": pm("/Producer"),
+                "Creator": pm("/Creator"),
+                "CreationDate": pm("/CreationDate"),
+                "ModDate": pm("/ModDate"),
+            })
+
+        new_meta = {}
+        for k, v in info.items():
+            try:
+                new_meta[k] = str(v)
+            except Exception:
+                pass
+
+        fields = {
+            "/Title": self.title_edit.text().strip(),
+            "/Author": self.author_edit.text().strip(),
+            "/Subject": self.subject_edit.text().strip(),
+            "/Keywords": self.keywords_edit.text().strip(),
+            "/Producer": self.producer_edit.text().strip(),
+            "/Creator": self.creator_edit.text().strip(),
+            "/CreationDate": self.creation_date_edit.text().strip(),
+            "/ModDate": self.mod_date_edit.text().strip(),
+        }
+
+        for key, value in fields.items():
+            if value:
+                new_meta[key] = value
+            else:
+                new_meta.pop(key, None)
+
+        writer = PdfWriter()
+        for p in reader.pages:
+            writer.add_page(p)
+
+        writer.add_metadata(new_meta)
+
+        temp_out = os.path.join(self.temp_dir, "temp_current.pdf")
+
+        try:
+            with open(temp_out, "wb") as f:
+                writer.write(f)
+        except Exception as e:
+            self.log(f"[ERROR] Cannot write PDF: {e}")
+            return
+
+        try:
+            shutil.move(temp_out, self.current_pdf_path)
+        except Exception as e:
+            self.log(f"[ERROR] Cannot replace original file: {e}")
+            return
+
+        if auto:
+            self.log("Metadata saved (auto).")
+        else:
+            self.log("Metadata saved.")
+
+        self.invalidate_status_for_path(self.current_pdf_path)
+        self.refresh_tree_item_for_path(self.current_pdf_path)
+        self.tree.viewport().update()
+
+        # در صورت فعال بودن تیک Rename، بعد از ذخیره متادیتا rename انجام شود
+        new_title = fields["/Title"]
+        if self.rename_checkbox.isChecked() and new_title:
+            folder = os.path.dirname(self.current_pdf_path)
+            nn_base = sanitize_filename(new_title)
+            nn = nn_base + ".pdf"
+            new_path = os.path.join(folder, nn)
+
+            if os.path.abspath(new_path) != os.path.abspath(self.current_pdf_path):
+                if os.path.exists(new_path):
+                    QMessageBox.warning(
+                        self, "Warning",
+                        f"Cannot rename. Target file already exists:\n{new_path}"
+                    )
+                    self.log(f"[WARN] Target exists: {new_path}")
+                else:
+                    try:
+                        old_path = self.current_pdf_path
+                        os.rename(self.current_pdf_path, new_path)
+                        self.log(f"File renamed to: {nn}")
+                        self.current_pdf_path = new_path
+                        self.file_name_edit.setText(nn_base)
+
+                        self.invalidate_status_for_path(old_path)
+                        self.invalidate_status_for_path(new_path)
+
+                        ap_old = os.path.abspath(old_path)
+                        ap_new = os.path.abspath(new_path)
+                        if ap_old in self._marked_files:
+                            self._marked_files.remove(ap_old)
+                            self._marked_files.add(ap_new)
+
+                        if self.folder_edit.text():
+                            idx = self.model.index(self.folder_edit.text())
+                            self.tree.setRootIndex(idx)
+                            self.tree.sortByColumn(3, Qt.DescendingOrder)
+
+                        self.refresh_tree_item_for_path(new_path)
+                        self.tree.viewport().update()
+                    except Exception as e:
+                        QMessageBox.warning(self, "Error", f"Rename failed:\n{e}")
+                        self.log(f"[ERROR] Rename failed: {e}")
+
+    # ------------------------- UNDO ------------------------------
+
+    def undo_metadata_changes(self):
+        if not self.metadata_history:
+            QMessageBox.information(self, "Undo", "Nothing to undo.")
+            return
+
+        last = self.metadata_history.pop()
+
+        prev_path = last.get("FilePath")
+        prev_name = last.get("FileName", "")
+
+        if prev_path and self.current_pdf_path and \
+           os.path.abspath(prev_path) != os.path.abspath(self.current_pdf_path):
+
+            if os.path.exists(prev_path):
+                QMessageBox.warning(
+                    self,
+                    "Undo Warning",
+                    f"Cannot rename file back. Target already exists:\n{prev_path}"
+                )
+                self.log(f"[WARN] Undo rename skipped, target exists: {prev_path}")
+            else:
+                try:
+                    old_path = self.current_pdf_path
+                    os.rename(self.current_pdf_path, prev_path)
+                    self.log(f"File renamed back to: {prev_name or os.path.basename(prev_path)}")
+                    self.current_pdf_path = prev_path
+                    base_prev = os.path.splitext(prev_name or os.path.basename(prev_path))[0]
+                    self.file_name_edit.setText(base_prev)
+                    if self.folder_edit.text():
+                        idx = self.model.index(self.folder_edit.text())
+                        self.tree.setRootIndex(idx)
+                        self.tree.sortByColumn(3, Qt.DescendingOrder)
+
+                    self.invalidate_status_for_path(old_path)
+                    self.invalidate_status_for_path(prev_path)
+
+                    ap_old = os.path.abspath(old_path)
+                    ap_prev = os.path.abspath(prev_path)
+                    if ap_old in self._marked_files:
+                        self._marked_files.remove(ap_old)
+                        self._marked_files.add(ap_prev)
+
+                    self.refresh_tree_item_for_path(prev_path)
+                    self.tree.viewport().update()
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "Undo Error",
+                        f"Failed to rename file back:\n{e}"
+                    )
+                    self.log(f"[ERROR] Undo rename failed: {e}")
+
+        self.title_edit.setText(last.get("Title", ""))
+        self.author_edit.setText(last.get("Author", ""))
+        self.subject_edit.setText(last.get("Subject", ""))
+        self.keywords_edit.setText(last.get("Keywords", ""))
+        self.producer_edit.setText(last.get("Producer", ""))
+        self.creator_edit.setText(last.get("Creator", ""))
+        self.creation_date_edit.setText(last.get("CreationDate", ""))
+        self.mod_date_edit.setText(last.get("ModDate", ""))
+
+        self.save_metadata(auto=True, add_to_history=False)
+        self.log("Undo applied (metadata + optional rename).")
+
+    # ------------------------- CLEANUP ---------------------------
+
+    def closeEvent(self, event):
+        self.save_settings()
+        try:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        event.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    win = PDFManager()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
